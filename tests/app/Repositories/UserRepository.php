@@ -1,6 +1,6 @@
 <?php
 
-namespace DTApi\Repository;
+namespace DTApi\Repositories;
 
 use DTApi\Models\Company;
 use DTApi\Models\Department;

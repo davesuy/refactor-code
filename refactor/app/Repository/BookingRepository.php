@@ -3,6 +3,7 @@
 namespace DTApi\Repository;
 
 use DTApi\Events\SessionEnded;
+use DTApi\Factory\UserFactory;
 use DTApi\Helpers\SendSMSHelper;
 use Event;
 use Carbon\Carbon;
@@ -61,14 +62,12 @@ class BookingRepository extends BaseRepository
         $usertype = '';
         $emergencyJobs = array();
         $noramlJobs = array();
-        if ($cuser && $cuser->is('customer')) {
-            $jobs = $cuser->jobs()->with('user.userMeta', 'user.average', 'translatorJobRel.user.average', 'language', 'feedback')->whereIn('status', ['pending', 'assigned', 'started'])->orderBy('due', 'asc')->get();
-            $usertype = 'customer';
-        } elseif ($cuser && $cuser->is('translator')) {
-            $jobs = Job::getTranslatorJobs($cuser->id, 'new');
-            $jobs = $jobs->pluck('jobs')->all();
-            $usertype = 'translator';
-        }
+
+        $userObject = UserFactory::getUserObject($cuser);
+
+        $jobs = $userObject->getJobs();
+        $usertype = $userObject->getType();
+
         if ($jobs) {
             foreach ($jobs as $jobitem) {
                 if ($jobitem->immediate == 'yes') {
@@ -94,30 +93,14 @@ class BookingRepository extends BaseRepository
         $page = $request->get('page');
         if (isset($page)) {
             $pagenum = $page;
-        } else {
-            $pagenum = "1";
         }
+
         $cuser = User::find($user_id);
-        $usertype = '';
+
         $emergencyJobs = array();
-        $noramlJobs = array();
-        if ($cuser && $cuser->is('customer')) {
-            $jobs = $cuser->jobs()->with('user.userMeta', 'user.average', 'translatorJobRel.user.average', 'language', 'feedback', 'distance')->whereIn('status', ['completed', 'withdrawbefore24', 'withdrawafter24', 'timedout'])->orderBy('due', 'desc')->paginate(15);
-            $usertype = 'customer';
-            return ['emergencyJobs' => $emergencyJobs, 'noramlJobs' => [], 'jobs' => $jobs, 'cuser' => $cuser, 'usertype' => $usertype, 'numpages' => 0, 'pagenum' => 0];
-        } elseif ($cuser && $cuser->is('translator')) {
-            $jobs_ids = Job::getTranslatorJobsHistoric($cuser->id, 'historic', $pagenum);
-            $totaljobs = $jobs_ids->total();
-            $numpages = ceil($totaljobs / 15);
+        $userObject = UserFactory::getUserObject($cuser);
 
-            $usertype = 'translator';
-
-            $jobs = $jobs_ids;
-            $noramlJobs = $jobs_ids;
-//            $jobs['data'] = $noramlJobs;
-//            $jobs['total'] = $totaljobs;
-            return ['emergencyJobs' => $emergencyJobs, 'noramlJobs' => $noramlJobs, 'jobs' => $jobs, 'cuser' => $cuser, 'usertype' => $usertype, 'numpages' => $numpages, 'pagenum' => $pagenum];
-        }
+        return $userObject->getJobHistory($emergencyJobs, $pagenum);
     }
 
     /**
@@ -1496,62 +1479,11 @@ class BookingRepository extends BaseRepository
         $job_id = $data['job_id'];
         $job = Job::findOrFail($job_id);
         $translator = Job::getJobsAssignedTranslatorDetail($job);
-        if ($cuser->is('customer')) {
-            $job->withdraw_at = Carbon::now();
-            if ($job->withdraw_at->diffInHours($job->due) >= 24) {
-                $job->status = 'withdrawbefore24';
-                $response['jobstatus'] = 'success';
-            } else {
-                $job->status = 'withdrawafter24';
-                $response['jobstatus'] = 'success';
-            }
-            $job->save();
-            Event::fire(new JobWasCanceled($job));
-            $response['status'] = 'success';
-            $response['jobstatus'] = 'success';
-            if ($translator) {
-                $data = array();
-                $data['notification_type'] = 'job_cancelled';
-                $language = TeHelper::fetchLanguageFromJobId($job->from_language_id);
-                $msg_text = array(
-                    "en" => 'Kunden har avbokat bokningen för ' . $language . 'tolk, ' . $job->duration . 'min, ' . $job->due . '. Var god och kolla dina tidigare bokningar för detaljer.'
-                );
-                if ($this->isNeedToSendPush($translator->id)) {
-                    $users_array = array($translator);
-                    $this->sendPushNotificationToSpecificUsers($users_array, $job_id, $data, $msg_text, $this->isNeedToDelayPush($translator->id));// send Session Cancel Push to Translaotor
-                }
-            }
-        } else {
-            if ($job->due->diffInHours(Carbon::now()) > 24) {
-                $customer = $job->user()->get()->first();
-                if ($customer) {
-                    $data = array();
-                    $data['notification_type'] = 'job_cancelled';
-                    $language = TeHelper::fetchLanguageFromJobId($job->from_language_id);
-                    $msg_text = array(
-                        "en" => 'Er ' . $language . 'tolk, ' . $job->duration . 'min ' . $job->due . ', har avbokat tolkningen. Vi letar nu efter en ny tolk som kan ersätta denne. Tack.'
-                    );
-                    if ($this->isNeedToSendPush($customer->id)) {
-                        $users_array = array($customer);
-                        $this->sendPushNotificationToSpecificUsers($users_array, $job_id, $data, $msg_text, $this->isNeedToDelayPush($customer->id));     // send Session Cancel Push to customer
-                    }
-                }
-                $job->status = 'pending';
-                $job->created_at = date('Y-m-d H:i:s');
-                $job->will_expire_at = TeHelper::willExpireAt($job->due, date('Y-m-d H:i:s'));
-                $job->save();
-//                Event::fire(new JobWasCanceled($job));
-                Job::deleteTranslatorJobRel($translator->id, $job_id);
 
-                $data = $this->jobToData($job);
+        $user = UserFactory::getUserObject($cuser);
 
-                $this->sendNotificationTranslator($job, $data, $translator->id);   // send Push all sutiable translators
-                $response['status'] = 'success';
-            } else {
-                $response['status'] = 'fail';
-                $response['message'] = 'Du kan inte avboka en bokning som sker inom 24 timmar genom DigitalTolk. Vänligen ring på +46 73 75 86 865 och gör din avbokning over telefon. Tack!';
-            }
-        }
+        $user->sendNotification($job, $translator);
+
         return $response;
     }
 
